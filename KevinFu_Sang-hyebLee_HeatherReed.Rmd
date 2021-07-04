@@ -24,8 +24,10 @@ library(fpp3)
 library(astsa)
 library(dplyr)
 library(Hmisc)
-#library(xts)
+library(feasts)
+library(seasonal)
 
+#for displaying time series with NA
 library(imputeTS)
 ```
 # The Keeling Curve
@@ -105,16 +107,58 @@ ggplot_na_distribution(noaa.ts.imputed.locf.tsibble)
 ```
 There are no missing values.
 
-```{r}
-gg_tsdisplay(noaa.ts.imputed.locf.tsibble, plot="partial", lag_max=32)
-```
-Time series graph shows an obvious upwards trends and seasonal pattern. Correlograms confirm this finding. 
-```{r}
-gg_season(as_tsibble(noaa.ts.imputed.locf.tsibble)) + ggtitle("Seasonal plot of CO2 levels")
-```
-As shown graph, CO2 level is definitely increasing every year. There is an obvious seasonal pattern -- CO2 level goes down from January to June but goes back up from Jun to December. Since the magnitude of the seasonal fluctuation does not vary with the level of time series, an addictive seasonal pattern should be more appropriate than a multiplicative seasonal pattern.
+## EDA on weekly data
 
 ```{r}
+noaa.ts.imputed.locf.tsibble %>% gg_tsdisplay(y=value , plot="partial", lag_max=32)
+```
+Time series graph shows a clear upward trend and seasonal pattern. Both ACF and PACF Correlograms confirm this finding. 
+```{r}
+noaa.ts.imputed.locf.tsibble %>% gg_season(y=value) + ggtitle("Seasonal plot of CO2 levels using weekly time series")
+```
+As shown graph, CO2 level is definitely increasing every year. There is an obvious seasonal pattern -- CO2 level goes down from January to June but goes back up from June to December. Since the magnitude of the seasonal fluctuation does not vary with the level of time series, an addictive seasonal pattern should be more appropriate than a multiplicative seasonal pattern.
+
+## EDA on Monthly data
+Let's convert weekly data to monthly.
+
+```{r}
+noaa.converted$month <- floor_date(noaa.converted$DATE, "month")
+nova.monthly <- noaa.converted %>% group_by(month) %>% dplyr::summarize(mean = mean(CO2))
+nova.monthly.ts <- as_tsibble(ts(nova.monthly$mean, start=c(1974,5), frequency=12))
+nova.monthly.ts <- na_locf(nova.monthly.ts)
+```
+
+```{r}
+nova.monthly.ts %>% gg_tsdisplay(y=value, plot="partial", lag_max=32)
+```
+As expected, monthly time series graph shows upwards trends and seasonal trends. Both ACF and PACF correlograms confirm this finding. Let's 
+```{r}
+nova.monthly.ts %>% gg_season(y=value) + ggtitle("Seasonal plot of CO2 levels using monthly time series")
+```
+As shown graph, CO2 level is definitely increasing every year. There is an clear cyclic seasonal pattern -- CO2 level goes up from January to May, goes down from MAy to September, and then goes back up from September to December. Since the magnitude of the seasonal fluctuation does not vary with the level of time series, an addictive seasonal pattern should be more appropriate than a multiplicative seasonal pattern.
+
+Let's decompose time series into trend, seasonal and irregular components.
+```{r}
+nova.monthly.ts %>% model(x11=feasts:::X11(value, type="additive")) %>% components() %>% autoplot()
+```
+
+In addition to the decomposition, we can apply Box-Cox transformation to stablize the variance.
+
+```{r}
+#choose lambda using guerrero's method
+lambda <- nova.monthly.ts %>% features(value, features=guerrero) %>% pull(lambda_guerrero)
+#print(lambda)
+#apply Box-Cox transformation with a chosen lambda
+nova.monthly.ts.boxcox <- nova.monthly.ts %>% mutate(value_bc = box_cox(value, lambda=lambda))
+
+#log-transformation
+#nova.monthly.ts.boxcox %>% autoplot(log(value), color="pink") + autolayer(nova.monthly.ts.boxcox, value_bc) + ggtitle("Transformed CO2 level series")
+
+```
+
+Let's apply decomposition again using the transformed values:
+```{r}
+nova.monthly.ts.boxcox %>% model(x11=feasts:::X11(value_bc, type="additive")) %>% components() %>% autoplot()
 
 ```
 
@@ -122,15 +166,49 @@ As shown graph, CO2 level is definitely increasing every year. There is an obvio
 
 Split the NOAA series into training and test sets, using the final two years of observations as the test set. Fit an ARIMA model to the series following all appropriate steps, including comparison of how candidate models perform both in-sample and (psuedo-) out-of-sample. Generate predictions for when atmospheric CO2 is expected to reach 450 parts per million, considering the prediction intervals as well as the point estimate. Generate a prediction for atmospheric CO2 levels in the year 2100. How confident are you that these will be accurate predictions?
 
+Let's split the NOAA series into training and test sets, taking the final two years as test set period for measuring pseudo out-of-sample forecasting performance.
+
 ```{r}
-noaa.ts.imputed.locf
+noaa.training <- nova.monthly.ts.boxcox %>% filter_index(~"2019 May")
+noaa.test <- nova.monthly.ts.boxcox %>% filter_index("2019 June"~.) 
+
+noaa.training %>% autoplot(value) + autolayer(noaa.test, colour="red") + ggtitle("CO2 level time series")
 
 ```
 
+Black and red lines represent training and test sets, respectively. Let's apply the log-transform first-differencing to the box-cox transformed series to stabilize the mean.
+```{r}
+noaa.training <- noaa.training %>% mutate(d_value = difference(value_bc,1))
+noaa.training %>% gg_tsdisplay(y=d_value, plot="partial", lag_max=32)
+```
 
+After the log-transformation and first-differencing, time series do not seem to have the upward trend but it still has a seasonal pattern. Let's apply the seasonal differencing to eliminate seasonality.
 
+```{r}
+noaa.training <- noaa.training %>% mutate(sd_value = difference(value_bc,12))
+noaa.training %>% gg_tsdisplay(y=sd_value, plot="partial", lag_max=32)
+noaa.training$sd_value %>% gghistogram()
+```
 
+We applied the difference at a frequency of 12 since we are using a monthly data. Seasonality seems to be largely subdued. Let's apply KPSS unit root test to check the stationairty.
+```{r}
+noaa.training %>% features(sd_value, unitroot_kpss)
+```
+Under the KPSS unit root test, null hypotheses of stationarity would be rejected at 1% of significance.
 
+Let's apply both seasonal and nonseasonal differencing.
+```{r}
+noaa.training <- noaa.training %>% mutate(d_sd_value = difference(sd_value))
+noaa.training %>% gg_tsdisplay(y=d_sd_value, plot="partial", lag_max=32) 
+noaa.training$d_sd_value %>% gghistogram()
+noaa.training %>% features(d_sd_value, unitroot_kpss)
+```
 
+Applying both seasonal and nonseasonal differencing seem to give more stationary series. P-value for KPSS test is 0.1. At alpha=0.05, we would not reject the null hypothesis of stationarity. 
+
+The correlogram of the first and seasonal-differened series shows significant spikes in ACF and PACF at lag 12, potentially suggesting a seasonal MA(1) and/or AR component. We can perform exhaustive search to find the best performing model.
+```{r}
+
+```
 
 
